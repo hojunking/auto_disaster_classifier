@@ -3,3 +3,4 @@ tf_efficientnet_b2_ns/
 wandb/
 test_result/
 /test_result
+/resnet18
