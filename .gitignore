@@ -5,3 +5,5 @@ test_result/
 /test_result
 /resnet18
 /efficientnet_b2
+/resnet50
+/resnet101
