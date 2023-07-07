@@ -46,14 +46,14 @@ CFG = {
     'fold_num': 5,
     'seed': 42,
     'model': 'inception_resnet_v2',
-    'img_size': 260,
+    'img_size': 256,
     'epochs': 200,
     'train_bs':128,
-    'valid_bs':32,
+    'valid_bs':64,
     'lr': 1e-4,
-    'num_workers': 8,
+    'num_workers': 10,
     'verbose_step': 1,
-    'patience' : 5,
+    'patience' : 10,
     'device': 'cuda:0',
     'freezing': False,
     'trainable_layer': 6,
@@ -239,14 +239,34 @@ def prepare_dataloader(df, trn_idx, val_idx, data_root=train.dir.values):
         
     train_ds = CustomDataset(train_, train_data_root, transform=transform_train, output_label=True)
     valid_ds = CustomDataset(valid_, valid_data_root, transform=transform_test,  output_label=True)
+
+    # WEIGHTEDRANDOMSAMPLER
+    class_counts = train_.label.value_counts(sort=False).to_dict()
+    num_samples = sum(class_counts.values())
+    print(f'cls_cnts: {len(class_counts)}\nnum_samples:{num_samples}')
     
+    # weight 제작, 전체 학습 데이터 수를 해당 클래스의 데이터 수로 나누어 줌
+    class_weights = {l:round(num_samples/class_counts[l], 2) for l in class_counts.keys()}
+    t_labels = train_.label.to_list()
+    
+    # class 별 weight를 전체 trainset에 대응시켜 sampler에 넣어줌
+    weights = [class_weights[t_labels[i]] for i in range(int(num_samples))]
+
+
+    # weight 제작, 전체 학습 데이터 수를 해당 클래스의 데이터 수로 나누어 줌
+    class_weights = {l:round(num_samples/class_counts[l], 2) for l in class_counts.keys()}
+
+    # class 별 weight를 전체 trainset에 대응시켜 sampler에 넣어줌
+    weights = [class_weights[t_labels[i]] for i in range(int(num_samples))] 
+    sampler = torch.utils.data.WeightedRandomSampler(torch.DoubleTensor(weights), int(num_samples))
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=CFG['train_bs'],
         pin_memory=True,
         drop_last=False,
-        shuffle=False,        
+        shuffle=False,
+        sampler=sampler, 
         num_workers=CFG['num_workers'],
     )
     val_loader = torch.utils.data.DataLoader(
@@ -536,14 +556,136 @@ if __name__ == '__main__':
     print(f'Best Fold F1 score: {best_fold} Top fold : {top_fold}')
 
 
-# In[4]:
-
-
-dist.destroy_process_group()
-
-
 # In[ ]:
 
 
+if __name__ == '__main__':
+    seed_everything(CFG['seed'])
+    
+    # WANDB TRACKER INIT
+    wandb.init(project=project_name, entity=user)
+    wandb.config.update(CFG)
+    wandb.run.name = run_name
+    wandb.define_metric("Train Accuracy", step_metric="epoch")
+    wandb.define_metric("Valid Accuracy", step_metric="epoch")
+    wandb.define_metric("Train Loss", step_metric="epoch")
+    wandb.define_metric("Valid Loss", step_metric="epoch")
+    wandb.define_metric("Train Macro F1 Score", step_metric="epoch")
+    wandb.define_metric("Valid Macro F1 Score", step_metric="epoch")
+    wandb.define_metric("Train-Valid Accuracy", step_metric="epoch")
+    
+    model_dir = CFG['model_path'] + '/{}'.format(run_name)
+    train_dir = train.dir.values
+    best_fold = 0
+    best_f1 =0.0
+    print('Model: {}'.format(CFG['model']))
+    # MAKE MODEL DIR
+    if not os.path.isdir(model_dir):
+        os.makedirs(model_dir)
+    
+    # STRATIFIED K-FOLD DEFINITION
+    folds = StratifiedKFold(n_splits=CFG['fold_num'], shuffle=True, random_state=CFG['seed']).split(np.arange(train.shape[0]), train.label.values)
+    
+    # TEST PROCESS FOLD BREAK
+    for fold, (trn_idx, val_idx) in enumerate(folds):
+        print(f'Training start with fold: {fold} epoch: {CFG["epochs"]} \n')
 
+        # EARLY STOPPING DEFINITION
+        early_stopping = EarlyStopping(patience=CFG["patience"], verbose=True)
+
+        # DATALOADER DEFINITION
+        train_loader, val_loader = prepare_dataloader(train, trn_idx, val_idx, data_root=train_dir)
+
+        # MODEL & DEVICE DEFINITION 
+        device = torch.device(CFG['device'])
+        model =Teacher(CFG['model'], train.label.nunique(), pretrained=True)
+        
+        # MODEL FREEZING
+        #model.freezing(freeze = CFG['freezing'], trainable_layer = CFG['trainable_layer'])
+        if CFG['freezing'] ==True:
+            for name, param in model.named_parameters():
+                if param.requires_grad == True:
+                    print(f"{name}: {param.requires_grad}")
+
+        model.to(device)
+        # MODEL DATA PARALLEL
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+
+        scaler = torch.cuda.amp.GradScaler()   
+        optimizer = torch.optim.Adam(model.parameters(), lr=CFG['lr'])
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.5, step_size=5)
+
+        # CRITERION (LOSS FUNCTION)
+        loss_tr = nn.CrossEntropyLoss().to(device) #MyCrossEntropyLoss().to(device)
+        loss_fn = nn.CrossEntropyLoss().to(device)
+
+        wandb.watch(model, loss_tr, log='all')
+        train_acc_list = []
+        train_matrix_list = []
+        train_f1_list = []
+        valid_acc_list = []
+        valid_matrix_list = []
+        valid_f1_list = []
+        
+
+        start = time.time()
+        print(f'Fold: {fold}')
+        for epoch in range(CFG['epochs']):
+            print('Epoch {}/{}'.format(epoch, CFG['epochs'] - 1))
+
+            # TRAINIG
+            train_preds_all, train_acc, train_loss, train_matrix, train_f1 = train_one_epoch(epoch, model, loss_tr,
+                                                                        optimizer, train_loader, device, scheduler=scheduler)
+            wandb.log({'Train Accuracy':train_acc, 'Train Loss' : train_loss, 'Train F1': train_f1, 'epoch' : epoch})
+
+            # VALIDATION
+            with torch.no_grad():
+                valid_preds_all, valid_acc, valid_loss, valid_matrix, valid_f1= valid_one_epoch(epoch, model, loss_fn,
+                                                                        val_loader, device, scheduler=None)
+                wandb.log({'Valid Accuracy':valid_acc, 'Valid Loss' : valid_loss, 'Valid F1': valid_f1 ,'epoch' : epoch})
+            print(f'Epoch [{epoch}], Train Loss : [{train_loss :.5f}] Val Loss : [{valid_loss :.5f}] Val F1 Score : [{valid_f1:.5f}]')
+            
+            # SAVE ALL RESULTS
+            train_acc_list.append(train_acc)
+            train_matrix_list.append(train_matrix)
+            train_f1_list.append(train_f1)
+
+            valid_acc_list.append(valid_acc)
+            valid_matrix_list.append(valid_matrix)
+            valid_f1_list.append(valid_f1)
+
+            # MODEL SAVE (THE BEST MODEL OF ALL OF FOLD PROCESS)
+            if valid_f1 > best_f1:
+                best_f1 = valid_f1
+                best_epoch = epoch
+                # SAVE WITH DATAPARARELLEL WRAPPER
+                #torch.save(model.state_dict(), (model_dir+'/{}.pth').format(CFG['model']))
+                # SAVE WITHOUT DATAPARARELLEL WRAPPER
+                torch.save(model.module.state_dict(), (model_dir+'/{}.pth').format(CFG['model']))
+
+            # EARLY STOPPING
+            stop = early_stopping(valid_f1)
+            if stop:
+                print("stop called")   
+                break
+
+        end = time.time() - start
+        time_ = str(datetime.timedelta(seconds=end)).split(".")[0]
+        print("time :", time_)
+
+        # PRINT BEST F1 SCORE MODEL OF FOLD
+        best_index = valid_f1_list.index(max(valid_f1_list))
+        print(f'fold: {fold}, Best Epoch : {best_index}/ {len(valid_f1_list)}')
+        print(f'Best Train Marco F1 : {train_f1_list[best_index]:.5f}')
+        print(train_matrix_list[best_index])
+        print(f'Best Valid Marco F1 : {valid_f1_list[best_index]:.5f}')
+        print(valid_matrix_list[best_index])
+        print('-----------------------------------------------------------------------')
+
+        # K-FOLD END
+        if valid_f1_list[best_index] > best_fold:
+            best_fold = valid_f1_list[best_index]
+            top_fold = fold
+    print(f'Best Fold F1 score: {best_fold} Top fold : {top_fold}')
 
