@@ -53,7 +53,7 @@ CFG = {
     'lr': 1e-4,
     'num_workers': 10,
     'verbose_step': 1,
-    'patience' : 10,
+    'patience' : 5,
     'device': 'cuda:0',
     'freezing': False,
     'trainable_layer': 6,
