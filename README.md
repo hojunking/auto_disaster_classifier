@@ -16,10 +16,10 @@ conda install pandas, numpy, tqdm, timm, albumentation
 - Classifier model (inception_resnet-v2) **[[Google drive]](https://drive.google.com/drive/folders/1OhiCNBPpkISCRuQ-8G0Z-HE5Kk9LAUx5?usp=sharing)**
 
 ### Proposed Method
-- Augment disaster images  
+- **Augment disaster images**  
 
     <img src="./asset/fig1.jpg" align="center" width="65%">  
 
-- Framework  
+- **Framework**  
 
     <img src="./asset/framework.png" align="center" width="70%">
